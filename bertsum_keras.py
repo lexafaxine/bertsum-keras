@@ -1,13 +1,11 @@
 from __future__ import print_function
 import tensorflow as tf
-from keras.models import Model, Sequential
 from tensorflow.keras import layers
 import numpy as np
 import os, re, logging
 from transformers import BertTokenizer, TFBertModel, BertConfig
 import json
-
-from keras.engine.topology import Layer
+import math
 
 NUM_TRAIN_EPOCHS = 100
 BATCH_SIZE = 16
@@ -273,10 +271,10 @@ def create_train_examples(json_path, bert_name, min_src_ntokens, max_src_ntokens
                 count += 1
                 examples.append(example)
 
-                if count == 7:
+                if count == 100:
                     break
 
-
+    print("Finish preprocessing")
     logging.info("Finish preprocessing")
 
     return examples
@@ -326,6 +324,7 @@ def create_inputs(examples, is_test=False):
             dataset_dict["mask"]
         ]
 
+    print("inputs shape=",(len(inputs), len(inputs[0])))
     return inputs
 
 
@@ -353,15 +352,19 @@ class PositionwiseFeedForward(layers.Layer):
 # Implement a PositionalEncoding
 class PositionalEncoding(layers.Layer):
 
-    def __init__(self, dropout, dim, max_len=500):
-        pe = tf.zeros([max_len, dim])
-        position = tf.range(0, max_len, dtype=tf.float32)
-        position = tf.expand_dims(position, axis=1)
-        div_term = tf.exp(tf.range(0, dim, 2, dtype=tf.float32) *
-                          -(tf.math.log(10000.0) / dim))
-        pe[:, 0::2] = tf.sin(position * div_term)
-        pe[:, 1::2] = tf.cos(position * div_term)
-        pe = tf.expand_dims(pe, axis=0)
+    def __init__(self, dropout, dim, max_len=5000):
+        # pe = tf.zeros([max_len, dim])
+        pe = np.zeros([max_len, dim])
+        # position = tf.range(0, max_len, dtype=tf.float32)
+        # position = tf.expand_dims(position, axis=1)
+        position = np.arange(0, max_len, dtype=float)
+        position = np.expand_dims(position, 1)
+        # div_term = tf.exp(tf.range(0, dim, 2, dtype=tf.float32) *
+        #                   -(tf.math.log(10000.0) / dim))
+        div_term = np.exp(np.arange(0, dim, step=2, dtype=float) * -(math.log(10000.0))/dim)
+        pe[:, 0::2] = np.sin(position * div_term)
+        pe[:, 1::2] = np.cos(position * div_term)
+        pe = np.expand_dims(pe, axis=0)
 
         super(PositionalEncoding, self).__init__()
         self.dropout = layers.Dropout(dropout)
@@ -369,18 +372,18 @@ class PositionalEncoding(layers.Layer):
         self.pe = pe
 
     def call(self, emb, step=None):
-        emb = emb * tf.math.sqrt(self.dim)
+        emb = emb * math.sqrt(self.dim)
         if (step):
             emb = emb + self.pe[:, step][:, None, :]
 
         else:
-            emb = emb + self.pe[:, :emb.size(1)]
-        emb = self.dropout(emb)
+            emb = emb + self.pe[:, :emb.shape[1]]
 
+        emb = self.dropout(emb)
         return emb
 
     def get_emb(self, emb):
-        return self.pe[:, :emb.size(1)]
+        return self.pe[:, :emb.shape[1]]
 
 
 # Implement the encoder transformer layer
@@ -424,53 +427,65 @@ class TransformerInterEncoder(layers.Layer):
         self.layer_norm = layers.LayerNormalization(epsilon=1e-6)
         self.wo = layers.Dense(1, input_shape=(d_model,), use_bias=True, activation="sigmoid")
 
-    def call(self, top_vecs, mask):
-        batch_size, n_sents = top_vecs.size(0), top_vecs.size(1)
+    def call(self, res, mask):
+        batch_size, n_sents = res.shape[0], res.shape[1]
         pos_emb = self.pos_emb.pe[:, :n_sents]
-        x = top_vecs * mask[:, :, None]
-        x = tf.cast(x, dtype=float) + pos_emb
+        mask = tf.cast(mask, dtype=tf.float32)
+        x = res * mask[:, :, None]
+        x += pos_emb
 
         for i in range(self.num_inter_layers):
             x = self.transformer_inter[i](i, x, x, 1 - mask)
 
         x = self.layer_norm(x)
         sent_scores = self.wo(x)
-        sent_scores = tf.squeeze(sent_scores, axis=-1) * tf.cast(mask, dtype=float)
+        sent_scores = tf.squeeze(sent_scores, axis=-1) * tf.cast(mask, dtype=tf.float32)
 
         return sent_scores
 
 
 # Implement a RNN encoder
-class RNNencoder(Model):
+class RNNencoder(tf.keras.Model):
     pass
 
 
 class Bert(layers.Layer):
 
     def __init__(self, bert_name, max_length):
-
         # self.output_dim = output_dim
         super(Bert, self).__init__()
         # Load transformers config
         if bert_name:
-            config = BertConfig.from_pretrained(bert_name)
-            config.output_hidden_states = True
+            self.config = BertConfig.from_pretrained(bert_name)
+            self.config.output_hidden_states = True
         else:
             pass
 
         # Load bert tokenizer
-        self.tokenizer = BertTokenizer.from_pretrained(pretrained_model_name_or_path=bert_name, config=config)
+        self.tokenizer = BertTokenizer.from_pretrained(pretrained_model_name_or_path=bert_name, config=self.config)
 
         # Load the Transformers BERT model
-        self.model = TFBertModel.from_pretrained(bert_name, config=config)
+        self.model = TFBertModel.from_pretrained(bert_name, config=self.config)
 
-    def call(self, inputs):
+    def call(self, inputs, training):
         # def call(self, x, segs, mask):
-        encoded_layers = self.model(inputs[0], token_type_ids=inputs[2], attention_mask=inputs[-1])
-        print(encoded_layers, len(encoded_layers))
-        top_vec = encoded_layers[-1]
-        print("*******")
-        return top_vec
+        # return the the embedding of [CLS]
+        outputs = self.model(inputs[0], token_type_ids=inputs[1], attention_mask=inputs[-3], training=training)
+        top_vec = outputs[0]
+        cls_ids = inputs[2]
+        index = inputs[-1]
+
+        index = tf.expand_dims(index, axis=-1)
+
+        index = tf.tile(index, [1, cls_ids.shape[1], 1])
+
+        indices = tf.concat([index, cls_ids[:, :, None]], axis=-1)
+
+        tf.print(indices)
+
+        res = tf.gather_nd(top_vec, indices)
+
+        return res
 
 
 class Summarizer(object):
@@ -488,13 +503,13 @@ class Summarizer(object):
         self.inter_layers = inter_layers
 
         if (encoder == 'classifier'):
-            model = Sequential()
+            model = tf.keras.Sequential()
             model.add(layers.Dense(1, input_shape=(self.hidden_size,), activation='sigmoid'))
             self.encoder = model
             # self.encoder = ..
 
         elif (encoder == "transformer"):
-            self.encoder = TransformerInterEncoder(self.bert.model.config.output_hidden_states, self.ff_size,
+            self.encoder = TransformerInterEncoder(self.hidden_size, self.ff_size,
                                                    self.heads,
                                                    self.dropout, self.inter_layers)
         elif (encoder == "rnn"):
@@ -508,19 +523,19 @@ class Summarizer(object):
 
         # Start of Keras Functional API #
 
-        input_ids = layers.Input(shape=(max_length,), type=tf.int32)
-        segment_ids = layers.Input(shape=(max_length,), type=tf.int32)
-        mask = layers.Input(shape=(max_length,), type=tf.int32)
-        cls_ids = layers.Input(shape=(100,), type=tf.int32)
-        mask_cls = layers.Input(shape=(100,), type=tf.int32)
+        input_ids = tf.keras.layers.Input(shape=(max_length,), dtype=tf.int32)
+        segment_ids = tf.keras.layers.Input(shape=(max_length,), dtype=tf.int32)
+        mask = tf.keras.layers.Input(shape=(max_length,), dtype=tf.int32)
+        cls_ids = tf.keras.layers.Input(shape=(100,), dtype=tf.int32)
+        mask_cls = tf.keras.layers.Input(shape=(100,), dtype=tf.int32)
 
-        top_vec = self.bert(input_ids, segment_ids, mask)
-        helper = tf.expand_dims(tf.range(top_vec.shape[0]), axis=1)
-        sents_vec = top_vec[helper, cls_ids]
-        sents_vec = sents_vec * mask_cls[:, :, None].float()
-        sent_scores = self.encoder(sents_vec, mask_cls).squeeze(-1)
+        helper = tf.keras.layers.Input(shape=(1,), dtype=tf.int32)
 
-        inputs = [input_ids, segment_ids, cls_ids, mask, mask_cls]
+        inputs = [input_ids, segment_ids, cls_ids, mask, mask_cls, helper]
+
+        res = self.bert(inputs, training=True)
+
+        sent_scores = self.encoder(res, mask_cls)
 
         outputs = sent_scores
 
@@ -530,19 +545,20 @@ class Summarizer(object):
         def custom_loss_wrapper(inputs):
 
             def custom_loss(y_true, y_pred):
-                mask = inputs[-1]
+                mask_cls = inputs[-1]
                 bce = tf.keras.losses.BinaryCrossentropy()
                 tf.dtypes.cast(y_true, dtype=float)
                 loss = bce(y_true, y_pred)
-                tf.dtypes.cast(mask, dtype=float)
-                loss = (loss * mask).sum()
+                tf.dtypes.cast(mask_cls, dtype=float)
+                loss = (loss * mask_cls).sum()
 
                 return loss
 
         # finish define custom loss function #
-
-        model = Model(inputs=inputs, outputs=outputs, name="BertSum")
-        model.compile(optimizer=opt, loss=custom_loss_wrapper(inputs=inputs))
+        bce1 = tf.keras.losses.BinaryCrossentropy()
+        model = tf.keras.Model(inputs=inputs, outputs=outputs, name="BertSum")
+        # model.compile(optimizer=opt, loss=custom_loss_wrapper(inputs=inputs), run_eagerly=True)
+        model.compile(optimizer=opt, loss=bce1, run_eagerly=False)
 
         # return #
         self.model = model
@@ -555,10 +571,14 @@ class Summarizer(object):
 
     # Get the batch data
     def generate_train_batch(self, x_samples, batch_size):
-        num_batches = len(x_samples) // batch_size
+
+        num_batches = len(x_samples[0]) // batch_size
+        print(num_batches)
         if num_batches == 0:
             raise ValueError("ddd")
+        # inputs =
         while True:
+            batch_x = []
             for batchIdx in range(0, num_batches):
                 start = batchIdx * batch_size
                 end = (batchIdx + 1) * batch_size
@@ -568,8 +588,11 @@ class Summarizer(object):
                 cls_ids_batch = x_samples[3][start:end]
                 mask_cls_batch = x_samples[4][start:end]
                 mask_batch = x_samples[5][start:end]
+                helper_batch = np.arange(0, batch_size, dtype=int)[:, None]
 
-                yield [input_ids_batch, segment_ids_batch, cls_ids_batch, mask_batch, mask_cls_batch], labels_batch
+                x = [input_ids_batch, segment_ids_batch, cls_ids_batch, mask_batch, mask_cls_batch, helper_batch]
+
+                yield x, labels_batch
 
     def generate_val_batch(self, x_samples, batch_size):
 
@@ -616,14 +639,18 @@ class Summarizer(object):
         train_generator = self.generate_train_batch(Xtrain, batch_size)
         validation_generator = self.generate_val_batch(Xval, batch_size)
 
-        num_train_steps = len(Xtrain) // batch_size
-        num_validation_steps = len(Xval) // batch_size
+        num_train_steps = len(Xtrain[0]) // batch_size
 
-        history = self.model.fit_generator(generator=train_generator, steps_per_epoch=num_train_steps, epochs=epochs,
-                                           verbose=True, validation_data=validation_generator,
-                                           validation_steps=num_validation_steps,
-                                           callbacks=[model_checkpoint_callback])
-        self.model.save("BertSum")
+        if Xval is not None:
+            num_validation_steps = len(Xval) // batch_size
+
+        history = self.model.fit(x=train_generator, epochs=epochs,
+                                           verbose=1, validation_data=None,
+                                           validation_steps=None,
+                                           steps_per_epoch = num_train_steps,
+                                           callbacks=None)
+
+        # self.model.save("BertSum")
         # self.model.load_weights(checkpoint_filepath)
         return history
 
