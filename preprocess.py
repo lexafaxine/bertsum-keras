@@ -109,13 +109,14 @@ class BertData(object):
 
 
 class Processor(object):
-    def __init__(self, bert_name, min_src_ntokens, max_src_ntokens, max_nsents, min_nsents, max_length):
+    def __init__(self, bert_name, min_src_ntokens, max_src_ntokens, max_nsents, min_nsents, max_length, mode):
 
         self.min_src_ntokens = min_src_ntokens
         self.max_src_ntokens = max_src_ntokens
         self.max_nsents = max_nsents
         self.min_nsents = min_nsents
         self.max_length = max_length
+        self.mode = mode
 
         if bert_name:
             config = BertConfig.from_pretrained(bert_name)
@@ -130,11 +131,33 @@ class Processor(object):
 
     def preprocess(self, src, tgt, oracle_ids):
         # oracle_ids is the extractive summarization of the text
+
+        mode = self.mode
+
         if (len(src) == 0):
             return None
 
-        # =========Filter the src data=========#
+        if mode == "predict":
+            input_text = src
+            src = []
+            n = len(input_text)
+            # find the sentence
+            start = 0
+            end = 0
+            for i in range(n):
+                if input_text[i] == ".":
+                    end = i
+                    # print("end=", end)
+                    sent_text = input_text[start:end]
+                    # print("sent_text:", sent_text)
+                    sent = sent_text.split()
+                    sent.append(".")
+                    src.append(sent)
+                    # print(sent)
+                    start = i + 1
+            print(src)
 
+        # =========Filter the src data=========#
         original_src_txt = [' '.join(s) for s in src]
         labels = [0] * len(src)
 
@@ -174,15 +197,20 @@ class Processor(object):
                 segments_ids += s * [1]
 
         cls_ids = [i for i, t in enumerate(src_subtoken_idxs) if t == self.cls_vid]
-
         labels = labels[:len(cls_ids)]
         assert len(cls_ids) == len(labels)
 
-        if sum(labels) == 0:
+        if sum(labels) == 0 and mode == "train":
             # all elements in labels is 0: dont make sense
             return None
 
-        tgt_txt = '<q>'.join([' '.join(tt) for tt in tgt])
+
+        if mode == "train":
+            tgt_txt = '<q>'.join([' '.join(tt) for tt in tgt])
+
+        if mode == "predict":
+            tgt_txt = ""
+
         src_txt = [original_src_txt[i] for i in idxs]
 
         # ======================PAD=========================== #
@@ -207,6 +235,7 @@ class Processor(object):
             cls_ids = cls_ids + ([-1] * padding_length_sent)
 
         assert len(cls_ids) == len(labels) == len(mask_cls)
+
         for i in range(0, 100):
             if cls_ids[i] == -1:
                 mask_cls[i] = 0
@@ -220,4 +249,8 @@ class Processor(object):
         cnn_data = BertData(input_ids=src_subtoken_idxs, labels=labels, segments_ids=segments_ids, cls_ids=cls_ids,
                             mask_cls=mask_cls, mask=mask, src_txt=src_txt,
                             tgt_txt=tgt_txt)
+        if mode == "predict":
+            return cnn_data, src
+
+
         return cnn_data
